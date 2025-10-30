@@ -1,0 +1,4 @@
+*.zip
+.claude/
+tmp/
+transcribe-podcast/resources/

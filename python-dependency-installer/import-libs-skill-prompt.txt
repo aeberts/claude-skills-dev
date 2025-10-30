@@ -1,0 +1,60 @@
+I want to create a skill which installs missing python dependencies to the system python directory using the command `uv pip install --system <library_to_install>` when
+  another claude skill tries to use a python library that is not installed locally.. Note that I am using pyenv to manage python versions on my local machine and so `uv pip
+  install --system <blah>` should automatically install the library to the directory `~/.pyenv/versions/<python_version>/lib/python<version>/site-packages/`. Once the
+  package(s) are installed, the skill should check to see that the package is available (for example with something like `uv pip show pandas` or `python -c "import pandas;
+  print(pandas.__version__, pandas.__file__)"`
+
+Here are answers to the clarifying questions:
+
+1. How should this skill be triggered?
+
+It should activate automatically when running a Claude Code skill that detects a python import error from running Python code (ask for confirmation from the user before installing the library). 
+
+This skill should also be triggered when the user explicitly says "install pandas" or similar. Note that in this case, the skill should first check to see if there is a virtual environment in the current working directory. If there is a .venv then install the library to the local venv using `uv pip install <libname>`. If there is no .venv in the current working directory then ask the user if the library (or libraries) should be installed system-wide with the command `uv pip install --system <libname>"
+
+Note that the skill should first check to see if the library is not already installed. If the current working directory contains a .venv directory then assume that we are working in a python project with a virtual environment and use the virtual environment. If the current working directory does not have a .venv then assume that the library should be installed system-wide and check the system site-packages directory. Note that I am using pyenv to manage system python versions so system python versions will be installed to `~/.pyenv/versions/<python_version>/lib/python<version>/site-packages/. Do not manually install libraries directly - use `uv pip install --system <library_name` and `uv` should choose the correct system directory automatically.
+
+  2. Should it handle multiple packages at once?
+
+The skill should be able to handle installing multiple packages at once.
+
+  3. What should happen after successful installation?
+
+    - Confirm that the installation is complete and that the library can be loaded properly.
+    - If the library is installed but the library cannot be loaded, troubleshoot the installation to resolve any bugs (version compatibility issues with the currently installed MacOS, compatibility issues with other libraries, missing API keys etc.)
+    - It should offer to re-run the command that originally failed before completing and if it succeeds then it should hand back control to  the task or skill that needed the library.
+
+  4. Any special considerations?
+    - Certain packages require special handling (e.g. API keys that need to be present in the local env. If the installation of the library fails because of an API error, ask the user to supply an API key and re-test the installation using that given API key.
+
+    - The skill should show a summary of the installation output (installation directories and a summary of the load test of the library.
+
+A typical usage example would be something like this:
+- A user request results in the creation of a python script. 
+- Claude tries to run the script and it fails with a dependency error -> trigger this python dependency installer script
+- The skill installs the missing dependencies according to the instructions above and tests that the dependency can be loaded and is available from the appropriate python version.
+- The skill ends with a summary of the dependency installation and Claude continues with the requested task.
+
+Please review these instructions carefully and resolve any inconsistencies or contradictions.
+
+Clarifications for Potential Issues:
+
+1. Automatic trigger (import error) - Installation location:
+  - Yes, the automatic trigger should ALSO check for .venv and follow the same venv vs system-wide logic as manual triggers.
+
+2. Checking if already installed:
+  - Check that the library is already installed BEFORE asking for confirmation.
+
+  - If a script fails with an import error, but the library exists in system site-packages (and we're in a venv), you should inform the user that the current working directory (cwd) contains a venv and present the user with the following options:
+        - Install the library in the venv as well.
+        - Skip the installation
+
+  3. Virtual environment detection:
+    - You specified checking for .venv directory
+    - You should also detect other common patterns like venv/, env/, or check if a virtual environment is already activated (VIRTUAL_ENV environment variable).
+
+  4. Re-running failed command:
+    - This step only apply to automatic triggers.
+
+  5. API key requirements:
+    - The check should include a load *and* use tests. If an API key is missing then ask the user to supply an API key and attempt to use it using something like `MYVAR=value ./myscript.py` (if that makes sense).
