@@ -1,0 +1,90 @@
+Implementation Plan: Audio Chunking & Compression for Large Podcast Files
+Overview
+Update the podcast transcription skill to handle large audio files (>25MB) by compressing audio and splitting into chunks for the Whisper API, then merging results into a unified transcript.
+Key Implementation Details
+Audio Processing Parameters:
+Compression: 16kHz stereo, 128kbps MP3
+Target chunk size: 20MB (stays under 25MB API limit)
+Chunk overlap: 5 seconds
+Deduplication: Text-based matching using longest common word sequence
+Diarization Strategy:
+Run diarization once on the full compressed audio file (Option B)
+Maintains consistent speaker labels across all chunks
+Timestamp Handling:
+Absolute timestamps from original audio start
+Apply cumulative time offsets when merging chunks
+Changes Required
+1. Add Audio Processing Dependency
+Add pydub to setup.md for audio compression/chunking
+Uses ffmpeg under the hood (usually pre-installed on Mac)
+2. Create New Module: scripts/audio_processor.py
+Functions:
+compress_audio(input_path, output_path, target_bitrate=128k, sample_rate=16000) - Compress to 16kHz stereo, 128kbps
+calculate_chunk_parameters(file_size, target_size=20MB, overlap_seconds=5) - Determine chunk count and duration
+split_audio_to_chunks(audio_path, chunk_dir, overlap_seconds=5, target_size=20MB) - Split compressed audio into overlapping chunks
+get_audio_duration(audio_path) - Get total duration for offset calculations
+3. Update scripts/transcribe_podcast.py
+New function: transcribe_chunked_audio(chunk_paths, openai_key)
+Transcribe each chunk via Whisper API
+Apply cumulative time offset to each chunk's timestamps
+Return merged word list with corrected absolute timestamps
+New function: deduplicate_overlaps(chunks_with_timestamps)
+Extract last 7-8 seconds of words from chunk N
+Extract first 7-8 seconds of words from chunk N+1
+Find longest matching word sequence (using text similarity)
+Remove duplicates from chunk N+1
+Merge into continuous word list
+Update main() workflow:
+Check if audio file exists
+Get file size; if >25MB or user flag --force-chunking:
+Create working directory: {audio_name}_chunks/
+Compress audio → compressed_audio.mp3
+Check compressed size; if still >25MB:
+Split into chunks with 5s overlap → chunk_001.mp3, chunk_002.mp3, etc.
+Run diarization on full compressed audio (not chunks)
+Transcribe each chunk and merge with deduplication
+Clean up working directory unless --keep-temp-files flag set
+If <25MB:
+Use existing single-file workflow (no changes)
+Continue with existing merge, format, and save logic
+New CLI flags:
+--force-chunking: Force chunking even if file <25MB (for testing)
+--keep-temp-files: Don't delete working directory after completion
+--chunk-size: Override default 20MB target (advanced)
+--overlap-seconds: Override default 5s overlap (advanced)
+4. Update Error Handling
+If any chunk transcription fails: stop immediately, report error with chunk number
+Provide detailed error context (which chunk, file size, API response)
+Keep all temp files for debugging when errors occur
+5. Update Documentation
+Update SKILL.md:
+Document new behavior for large files
+Explain working directory structure
+Add examples with --keep-temp-files and --force-chunking flags
+Update references/setup.md:
+Add pydub to installation instructions
+Note ffmpeg dependency (pre-installed on most systems)
+File Structure After Processing
+original_podcast.mp3            # Original file
+original_podcast_chunks/        # Working directory (optional cleanup)
+  ├── compressed_audio.mp3      # Compressed version
+  ├── chunk_001.mp3             # First chunk
+  ├── chunk_002.mp3             # Second chunk
+  └── ...
+original_podcast.md             # Final transcript
+Testing Strategy
+Test with small file (<25MB) - should use existing workflow
+Test with medium file (25-50MB) - should compress and transcribe as single file
+Test with large file (>50MB) - should compress and chunk
+Test --force-chunking flag with small file to verify chunking logic
+Test --keep-temp-files to verify temp directory creation
+Test error handling by simulating API failure mid-transcription
+Estimated Complexity
+Audio processing module: Medium (3-4 hours)
+Chunk deduplication logic: Medium-High (4-5 hours)
+Integration into main script: Medium (3-4 hours)
+Testing & debugging: High (6-8 hours)
+Documentation updates: Low (1-2 hours)
+Total estimate: 17-23 hours of development + testing
+Questions Resolved
+✓ Compression: 16kHz stereo, 128kbps ✓ Chunking: Fixed size (20MB target) ✓ Overlap: 5 seconds ✓ Deduplication: Text-based (longest common word sequence) ✓ Diarization: Full compressed audio (Option B) ✓ Timestamps: Absolute from original audio start ✓ Error handling: Fail fast with detailed debugging info ✓ Temp files: Configurable cleanup via --keep-temp-files flag

@@ -1,4 +1,5 @@
 *.zip
 .claude/
 tmp/
-transcribe-podcast/resources/
+__pycache__/
+transcribe-podcast/samples/

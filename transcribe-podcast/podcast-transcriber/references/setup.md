@@ -34,9 +34,15 @@ uv pip install openai pyannote.audio
 # Use the standard install - it automatically includes MPS support
 uv pip install torch torchvision torchaudio
 
-# Install additional audio processing dependencies
+# Install audio processing dependencies (for large file handling)
 uv pip install pydub
 ```
+
+**Note on pydub and ffmpeg:**
+- `pydub` requires `ffmpeg` for audio processing
+- On Mac, ffmpeg is usually pre-installed or available via Homebrew
+- Verify ffmpeg: `ffmpeg -version`
+- If needed, install via Homebrew: `brew install ffmpeg`
 
 **Note:** Do NOT use the CUDA (`--index-url https://download.pytorch.org/whl/cu121`) or CPU-only versions of PyTorch on Mac M1. The default installation automatically uses Apple's Metal Performance Shaders (MPS) for GPU acceleration.
 
@@ -67,12 +73,15 @@ export HF_TOKEN="hf_..."
 
 Test that everything is installed correctly:
 
-```python
+```bash
 # Test imports
-python -c "import openai; import torch; from pyannote.audio import Pipeline; print('✅ All dependencies installed')"
+python -c "import openai; import torch; from pyannote.audio import Pipeline; from pydub import AudioSegment; print('✅ All dependencies installed')"
 
 # Check PyTorch device availability (Mac M1)
 python -c "import torch; print('MPS available:', torch.backends.mps.is_available())"
+
+# Verify ffmpeg is available
+ffmpeg -version
 ```
 
 ## Troubleshooting
@@ -102,8 +111,28 @@ If you get MPS-related errors:
 
 For very large audio files (>2 hours):
 - The diarization step may consume significant RAM (10-15GB)
-- Consider splitting large files into smaller chunks
+- The script now automatically compresses and chunks large files (>25MB)
+- Diarization runs on compressed audio (reduces memory usage)
 - Close other applications to free up memory
+
+### pydub/ffmpeg Issues
+
+If you get errors about ffmpeg not found:
+```bash
+# Check if ffmpeg is installed
+ffmpeg -version
+
+# Mac: Install via Homebrew
+brew install ffmpeg
+
+# Linux: Install via package manager
+sudo apt-get install ffmpeg  # Ubuntu/Debian
+sudo yum install ffmpeg      # CentOS/RHEL
+```
+
+If pydub cannot find ffmpeg even when it's installed:
+- Ensure ffmpeg is in your PATH: `which ffmpeg`
+- Try reinstalling pydub: `uv pip install --force-reinstall pydub`
 
 ## Audio File Format Support
 

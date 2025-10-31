@@ -67,6 +67,42 @@ python scripts/transcribe_podcast.py audio.mp3 --no-name-detection
 python scripts/transcribe_podcast.py audio.mp3 --openai-key sk-... --hf-token hf_...
 ```
 
+**Handling Large Files (>25MB):**
+
+For audio files exceeding the Whisper API's 25MB limit, the script automatically:
+1. Compresses audio to 16kHz stereo, 128kbps (typically 60-70% size reduction)
+2. Splits into ~20MB chunks with 5-second overlap if still needed
+3. Transcribes each chunk separately with timestamp offset calculation
+4. Runs diarization on full compressed audio (ensures consistent speaker labels)
+5. Merges transcripts using timestamp-based deduplication
+
+Working files are saved to `<audio_name>_chunks/` directory:
+```
+podcast_episode_chunks/
+├── compressed_audio.mp3      # Compressed version for diarization
+├── chunk_001.mp3             # First chunk (if needed)
+├── chunk_002.mp3             # Second chunk
+└── chunk_003.mp3             # Etc.
+```
+
+By default, working files are **kept for debugging**. Use `--delete-temp-files` to clean up:
+
+```bash
+# Keep working files (default)
+python scripts/transcribe_podcast.py large_podcast.mp3
+
+# Clean up after successful completion
+python scripts/transcribe_podcast.py large_podcast.mp3 --delete-temp-files
+
+# Force chunking for testing (even if <25MB)
+python scripts/transcribe_podcast.py small_file.mp3 --force-chunking
+
+# Customize chunk parameters (advanced)
+python scripts/transcribe_podcast.py huge_file.mp3 --chunk-size 15 --overlap-seconds 10
+```
+
+**Note:** If transcription fails, working files are always preserved for debugging, regardless of the `--delete-temp-files` flag.
+
 **When to use:**
 - User provides an audio file and asks to transcribe it
 - User requests "transcribe this podcast"
@@ -168,8 +204,22 @@ python scripts/format_transcript.py wall_of_text.txt
 
 **Memory errors during diarization**
 - Close other applications to free RAM
-- Split large files into smaller chunks (e.g., 30-minute segments)
-- Process on a machine with more RAM (16GB+ recommended for long files)
+- Diarization runs on the compressed audio (smaller than original)
+- Process on a machine with more RAM (16GB+ recommended for very long files)
+
+**"File exceeds 25MB limit" / Large file errors**
+- The script automatically handles this - it will compress and chunk the audio
+- Check that `pydub` is installed: `uv pip install pydub`
+- Verify ffmpeg is available: `ffmpeg -version`
+- If compression isn't enough, the script will automatically chunk the file
+- Working files are kept in `<audio_name>_chunks/` for debugging
+
+**Chunk transcription failures**
+- Check the error message for which chunk failed and why
+- Working files in `<audio_name>_chunks/` are preserved for debugging
+- Verify chunk size with: `ls -lh <audio_name>_chunks/`
+- Try reducing chunk size: `--chunk-size 15` (instead of default 20MB)
+- Check OpenAI API rate limits if multiple chunks fail
 
 ## Example Usage Patterns
 

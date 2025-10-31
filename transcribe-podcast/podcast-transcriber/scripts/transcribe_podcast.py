@@ -19,6 +19,7 @@ import argparse
 import os
 import sys
 import re
+import shutil
 from pathlib import Path
 from datetime import timedelta
 import json
@@ -39,6 +40,18 @@ try:
     import torch
 except ImportError:
     print("Error: torch not installed. Run: uv pip install torch torchvision torchaudio")
+    sys.exit(1)
+
+# Import audio processing utilities
+try:
+    from audio_processor import (
+        compress_audio,
+        get_audio_duration,
+        get_file_size_mb,
+        split_audio_to_chunks
+    )
+except ImportError:
+    print("Error: audio_processor module not found. Ensure audio_processor.py is in the same directory.")
     sys.exit(1)
 
 
@@ -141,6 +154,166 @@ def diarize_audio(audio_path, hf_token):
     return diarization
 
 
+def deduplicate_overlap_words(words_list):
+    """
+    Remove duplicate words from overlapping regions using timestamp-based approach.
+
+    This function implements Option A: Pure timestamp-based deduplication.
+    Words are already tagged with absolute timestamps before calling this function.
+
+    Args:
+        words_list: List of word lists, one per chunk (already with absolute timestamps)
+                   Each word has: {'word': str, 'start': float, 'end': float}
+
+    Returns:
+        List of deduplicated words with absolute timestamps, sorted by start time
+
+    Algorithm:
+        1. Keep all words from chunk 1
+        2. For each subsequent chunk N:
+           - Find the end time of chunk N-1
+           - Skip words from chunk N where start_time < end_time of chunk N-1
+           - Keep remaining words from chunk N
+        3. Sort final word list by start timestamp
+    """
+    if not words_list:
+        return []
+
+    if len(words_list) == 1:
+        return words_list[0]
+
+    deduplicated = []
+
+    # Keep all words from first chunk
+    deduplicated.extend(words_list[0])
+    previous_end_time = words_list[0][-1]['end'] if words_list[0] else 0.0
+
+    # Process subsequent chunks
+    for chunk_idx, chunk_words in enumerate(words_list[1:], start=1):
+        if not chunk_words:
+            continue
+
+        # Find where overlap ends: skip words that start before previous chunk ended
+        kept_words = []
+        skipped_count = 0
+
+        for word in chunk_words:
+            if word['start'] >= previous_end_time:
+                # Word is past the overlap region, keep it
+                kept_words.append(word)
+            else:
+                # Word is in overlap region, skip it
+                skipped_count += 1
+
+        print(f"  Chunk {chunk_idx + 1}: Skipped {skipped_count} overlapping words, kept {len(kept_words)} words")
+
+        deduplicated.extend(kept_words)
+
+        # Update previous end time
+        if kept_words:
+            previous_end_time = kept_words[-1]['end']
+
+    # Sort by start time to ensure proper ordering
+    deduplicated.sort(key=lambda w: w['start'])
+
+    return deduplicated
+
+
+def transcribe_chunked_audio(chunk_info, openai_key):
+    """
+    Transcribe multiple audio chunks and merge with absolute timestamps.
+
+    Args:
+        chunk_info: List of tuples (chunk_path, start_time_seconds, duration_seconds)
+                   start_time_seconds is absolute time from original audio start
+        openai_key: OpenAI API key
+
+    Returns:
+        Combined transcript object with absolute timestamps
+
+    Algorithm:
+        1. Transcribe each chunk via Whisper API (timestamps are chunk-relative, starting at 0)
+        2. For each chunk's words, apply time offset to convert to absolute timestamps:
+           - word.start += start_time_seconds
+           - word.end += start_time_seconds
+        3. Deduplicate overlaps using deduplicate_overlap_words()
+        4. Create a combined transcript-like object
+    """
+    print(f"\nTranscribing {len(chunk_info)} chunks...")
+
+    all_chunks_words = []
+    all_segments = []
+
+    for idx, (chunk_path, start_time, duration) in enumerate(chunk_info, start=1):
+        print(f"\n  Transcribing chunk {idx}/{len(chunk_info)}: {Path(chunk_path).name}")
+        print(f"  Time range: [{start_time:.2f}s - {start_time + duration:.2f}s]")
+
+        try:
+            # Transcribe this chunk (timestamps will be relative to chunk start, i.e., 0.0)
+            transcript = transcribe_audio(chunk_path, openai_key)
+
+            # Extract words from transcript
+            chunk_words = []
+            if hasattr(transcript, 'words') and transcript.words:
+                for word_data in transcript.words:
+                    if isinstance(word_data, dict):
+                        word = word_data['word']
+                        word_start = word_data['start']
+                        word_end = word_data['end']
+                    else:
+                        word = word_data.word
+                        word_start = word_data.start
+                        word_end = word_data.end
+
+                    # Apply time offset to convert to absolute timestamps
+                    chunk_words.append({
+                        'word': word,
+                        'start': word_start + start_time,
+                        'end': word_end + start_time
+                    })
+            else:
+                # Fallback: use segments if words not available
+                for segment in transcript.segments:
+                    chunk_words.append({
+                        'word': segment.text,
+                        'start': segment.start + start_time,
+                        'end': segment.end + start_time
+                    })
+
+            print(f"  Transcribed {len(chunk_words)} words with timestamps adjusted to absolute time")
+            all_chunks_words.append(chunk_words)
+
+            # Also collect segments for potential fallback
+            if hasattr(transcript, 'segments'):
+                for segment in transcript.segments:
+                    all_segments.append(segment)
+
+        except Exception as e:
+            # Detailed error reporting
+            chunk_size_mb = get_file_size_mb(chunk_path)
+            print(f"\n❌ Error: Transcription failed for chunk {idx}/{len(chunk_info)}")
+            print(f"   Chunk file: {chunk_path}")
+            print(f"   Chunk size: {chunk_size_mb:.2f} MB")
+            print(f"   Time range: {start_time:.2f}s - {start_time + duration:.2f}s")
+            print(f"   API Error: {str(e)}")
+            print(f"\nTemporary files have been preserved for debugging.")
+            raise
+
+    # Deduplicate overlapping words
+    print(f"\nDeduplicating overlapping regions...")
+    merged_words = deduplicate_overlap_words(all_chunks_words)
+    print(f"✓ Final transcript contains {len(merged_words)} words")
+
+    # Create a transcript-like object to return
+    # This mimics the structure returned by transcribe_audio()
+    class ChunkedTranscript:
+        def __init__(self, words, segments):
+            self.words = words
+            self.segments = segments
+
+    return ChunkedTranscript(merged_words, all_segments)
+
+
 def merge_transcription_and_diarization(transcript, diarization):
     """
     Merge word-level transcription with speaker diarization.
@@ -212,6 +385,73 @@ def merge_transcription_and_diarization(transcript, diarization):
             })
 
     return segments
+
+
+def format_transcript_without_diarization(transcript, audio_path):
+    """
+    Format transcript without speaker diarization.
+    Used as fallback when diarization fails.
+    """
+    output = []
+
+    # Add metadata header
+    audio_name = Path(audio_path).name
+
+    output.append("# Podcast Transcript\n")
+    output.append(f"**File:** {audio_name}\n")
+    output.append("**Note:** Speaker diarization was not available for this transcript.\n")
+    output.append("\n---\n\n")
+
+    # Get text from transcript
+    if hasattr(transcript, 'text'):
+        # Simple transcript with just text
+        output.append(transcript.text)
+    elif hasattr(transcript, 'segments'):
+        # Transcript with segments
+        for segment in transcript.segments:
+            timestamp = format_timestamp(segment.start)
+            output.append(f"{timestamp}\n\n")
+            output.append(f"{segment.text}\n\n")
+    elif hasattr(transcript, 'words'):
+        # Transcript with word-level timestamps
+        # Group words into sentences/paragraphs
+        current_paragraph = []
+        paragraph_start = None
+
+        for word_data in transcript.words:
+            if isinstance(word_data, dict):
+                word = word_data['word']
+                start = word_data['start']
+            else:
+                word = word_data.word
+                start = word_data.start
+
+            if paragraph_start is None:
+                paragraph_start = start
+
+            current_paragraph.append(word)
+
+            # Break into paragraphs every ~30 seconds
+            if start - paragraph_start > 30:
+                timestamp = format_timestamp(paragraph_start)
+                para_text = ' '.join(current_paragraph)
+                para_text = clean_filler_words(para_text)
+                if para_text:
+                    output.append(f"{timestamp}\n\n")
+                    output.append(f"{para_text}\n\n")
+                current_paragraph = []
+                paragraph_start = None
+
+        # Write final paragraph
+        if current_paragraph:
+            timestamp = format_timestamp(paragraph_start)
+            para_text = ' '.join(current_paragraph)
+            para_text = clean_filler_words(para_text)
+            if para_text:
+                output.append(f"{timestamp}\n\n")
+                output.append(f"{para_text}\n\n")
+
+    return ''.join(output)
 
 
 def format_transcript(segments, audio_path, speaker_names=None):
@@ -318,6 +558,33 @@ def main():
         action="store_true",
         help="Skip automatic speaker name detection"
     )
+    parser.add_argument(
+        "--force-chunking",
+        action="store_true",
+        help="Force chunked processing even if file <25MB (for testing)"
+    )
+    parser.add_argument(
+        "--delete-temp-files",
+        action="store_true",
+        help="Delete working directory after successful completion (default: keep files)"
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=20,
+        help="Target chunk size in MB (default: 20)"
+    )
+    parser.add_argument(
+        "--overlap-seconds",
+        type=int,
+        default=5,
+        help="Overlap duration between chunks in seconds (default: 5)"
+    )
+    parser.add_argument(
+        "--no-diarization",
+        action="store_true",
+        help="Skip speaker diarization and only transcribe (faster, no speaker labels)"
+    )
 
     args = parser.parse_args()
 
@@ -333,8 +600,9 @@ def main():
         sys.exit(1)
 
     hf_token = args.hf_token or os.environ.get("HF_TOKEN")
-    if not hf_token:
-        print("Error: HuggingFace token required. Provide via --hf-token or HF_TOKEN env var")
+    if not hf_token and not args.no_diarization:
+        print("Error: HuggingFace token required for speaker diarization.")
+        print("Provide via --hf-token or HF_TOKEN env var, or use --no-diarization to skip speaker identification")
         sys.exit(1)
 
     # Set output file
@@ -346,37 +614,124 @@ def main():
     print(f"Processing: {args.audio_file}")
     print(f"Output will be saved to: {output_file}\n")
 
-    # Step 1: Transcribe
-    transcript = transcribe_audio(args.audio_file, openai_key)
+    # Check file size to determine processing strategy
+    file_size_mb = get_file_size_mb(args.audio_file)
+    print(f"Audio file size: {file_size_mb:.2f} MB")
 
-    # Step 2: Diarize
-    diarization = diarize_audio(args.audio_file, hf_token)
+    # Determine if chunking is needed
+    needs_chunking = file_size_mb > 25 or args.force_chunking
+    work_dir = None
 
-    # Step 3: Merge transcription and diarization
-    print("Merging transcription with speaker labels...")
-    segments = merge_transcription_and_diarization(transcript, diarization)
-    print("✓ Merge complete")
+    if needs_chunking:
+        print(f"\nFile exceeds 25MB limit or --force-chunking flag set. Using chunked processing...\n")
 
-    # Step 4: Try to identify speaker names
-    speaker_names = None
-    if not args.no_name_detection:
-        print("Attempting to identify speaker names...")
-        full_text = ' '.join(seg['text'] for seg in segments[:100])  # First 100 segments
-        num_speakers = len(set(seg['speaker'] for seg in segments))
-        speaker_names = identify_speaker_names(full_text, num_speakers)
-        if speaker_names:
-            print(f"✓ Identified speakers: {speaker_names}")
+        # Create working directory
+        audio_path = Path(args.audio_file)
+        work_dir = audio_path.parent / f"{audio_path.stem}_chunks"
+        work_dir.mkdir(exist_ok=True)
+        print(f"Working directory: {work_dir}\n")
+
+        # Step 1: Compress audio
+        compressed_path = work_dir / "compressed_audio.mp3"
+        print(f"Step 1: Compressing audio...")
+        compress_audio(args.audio_file, str(compressed_path))
+        compressed_size = get_file_size_mb(str(compressed_path))
+        print(f"Compressed size: {compressed_size:.2f} MB\n")
+
+        # Step 2: Check if still needs chunking after compression
+        if compressed_size > 25:
+            print(f"Step 2: Compressed file still exceeds 25MB. Splitting into chunks...")
+            chunk_info = split_audio_to_chunks(
+                str(compressed_path),
+                str(work_dir),
+                overlap_seconds=args.overlap_seconds,
+                target_size_mb=args.chunk_size
+            )
+            print(f"Created {len(chunk_info)} chunks\n")
+
+            # Step 3: Transcribe chunks
+            print(f"Step 3: Transcribing chunks...")
+            transcript = transcribe_chunked_audio(chunk_info, openai_key)
+            audio_for_diarization = str(compressed_path)
         else:
-            print("⚠ Could not identify speaker names, using generic labels")
+            # Compressed file fits in one API call
+            print(f"Step 2: Compressed file fits in single API call. Skipping chunking.\n")
+            print(f"Step 3: Transcribing audio...")
+            transcript = transcribe_audio(str(compressed_path), openai_key)
+            audio_for_diarization = str(compressed_path)
 
-    # Step 5: Format and save
-    print("Formatting transcript...")
-    formatted = format_transcript(segments, args.audio_file, speaker_names)
+        # Step 4: Diarize using compressed audio (not chunks)
+        if not args.no_diarization:
+            print(f"\nStep 4: Performing speaker diarization on full audio...")
+            try:
+                diarization = diarize_audio(audio_for_diarization, hf_token)
+            except Exception as e:
+                print(f"\n⚠ Warning: Speaker diarization failed: {e}")
+                print("Saving transcript without speaker labels...")
+                diarization = None
+        else:
+            print(f"\nStep 4: Skipping speaker diarization (--no-diarization flag set)")
+            diarization = None
+
+    else:
+        # Original workflow for files < 25MB
+        print(f"File size OK for direct processing (no compression/chunking needed)\n")
+
+        # Step 1: Transcribe
+        transcript = transcribe_audio(args.audio_file, openai_key)
+
+        # Step 2: Diarize
+        if not args.no_diarization:
+            try:
+                diarization = diarize_audio(args.audio_file, hf_token)
+            except Exception as e:
+                print(f"\n⚠ Warning: Speaker diarization failed: {e}")
+                print("Saving transcript without speaker labels...")
+                diarization = None
+        else:
+            print("Skipping speaker diarization (--no-diarization flag set)")
+            diarization = None
+
+    # Format and save based on whether diarization succeeded
+    if diarization is not None:
+        # Merge transcription and diarization
+        print("\nMerging transcription with speaker labels...")
+        segments = merge_transcription_and_diarization(transcript, diarization)
+        print("✓ Merge complete")
+
+        # Try to identify speaker names
+        speaker_names = None
+        if not args.no_name_detection:
+            print("Attempting to identify speaker names...")
+            full_text = ' '.join(seg['text'] for seg in segments[:100])  # First 100 segments
+            num_speakers = len(set(seg['speaker'] for seg in segments))
+            speaker_names = identify_speaker_names(full_text, num_speakers)
+            if speaker_names:
+                print(f"✓ Identified speakers: {speaker_names}")
+            else:
+                print("⚠ Could not identify speaker names, using generic labels")
+
+        # Format and save
+        print("\nFormatting transcript...")
+        formatted = format_transcript(segments, args.audio_file, speaker_names)
+    else:
+        # Diarization failed or was skipped, save transcript without speaker labels
+        print("\nFormatting transcript without speaker labels...")
+        formatted = format_transcript_without_diarization(transcript, args.audio_file)
 
     with open(output_file, 'w') as f:
         f.write(formatted)
 
     print(f"\n✅ Transcript saved to: {output_file}")
+
+    # Handle cleanup of temporary files
+    if work_dir and args.delete_temp_files:
+        print(f"\nCleaning up temporary files...")
+        shutil.rmtree(work_dir)
+        print(f"✓ Deleted {work_dir}")
+    elif work_dir:
+        print(f"\nTemporary files preserved in: {work_dir}")
+        print(f"Use --delete-temp-files flag to auto-cleanup on next run")
 
 
 if __name__ == "__main__":
