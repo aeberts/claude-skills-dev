@@ -1387,3 +1387,14 @@ the United States.
 
 **Status:** Ready for implementation
 **Last Updated:** 2025-10-31
+
+## Implementation Task List
+1. Audit current transcript pipeline: run the existing formatter on the reference file, note output structure, and confirm availability of `transcript.words` data for paragraph grouping.
+2. Build `podcast-transcriber/utils/formatting.py`: implement paragraph grouping, pause detection, duplicate timestamp filtering, and markdown helpers per Phase 1 specs with docstrings where logic is non-trivial.
+3. Update `podcast-transcriber/scripts/transcribe_podcast.py`: wire in the new helpers, expose CLI flags for readability options, and ensure legacy behavior is preserved when new flags are disabled.
+4. Create `/scripts/reformat_transcript.py`: accept an input markdown transcript, apply the new formatting pipeline, and write the improved output while guarding against overwriting source files.
+5. Generate section headers and TOC entries: implement major-section detection (duration + topic cues), add anchor IDs, and verify links render correctly in markdown viewers.
+6. Normalize timestamp handling: ensure monotonically increasing timestamps, drop or merge reset segments, and preserve start times for each paragraph block.
+7. Write automated tests in `/tests/test_transcript_formatting.py`: cover paragraph grouping, duplicate timestamp drops, section creation, TOC link generation, and CLI integration.
+8. Update documentation (`podcast-transcriber/SKILL.md`, `transcribe-podcast/README.md`): describe new flags, expected output structure, and reformat utility usage.
+9. Validate end-to-end: run the pipeline on short, medium, and long transcripts, compare against success criteria, and capture follow-up tweaks before shipping.
