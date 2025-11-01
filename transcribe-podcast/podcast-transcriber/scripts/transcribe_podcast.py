@@ -21,7 +21,6 @@ import sys
 import re
 import shutil
 from pathlib import Path
-from datetime import timedelta
 import json
 
 try:
@@ -54,25 +53,22 @@ except ImportError:
     print("Error: audio_processor module not found. Ensure audio_processor.py is in the same directory.")
     sys.exit(1)
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+PACKAGE_ROOT = SCRIPT_DIR.parent
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
 
-def format_timestamp(seconds):
-    """Convert seconds to HH:MM:SS format."""
-    td = timedelta(seconds=seconds)
-    hours = td.seconds // 3600
-    minutes = (td.seconds % 3600) // 60
-    secs = td.seconds % 60
-    return f"[{hours:02d}:{minutes:02d}:{secs:02d}]"
-
-
-def clean_filler_words(text):
-    """Remove excessive filler words and clean up text."""
-    # Remove excessive um, uh, etc.
-    text = re.sub(r'\b(um|uh|er|ah)\b', '', text, flags=re.IGNORECASE)
-    # Remove multiple spaces
-    text = re.sub(r'\s+', ' ', text)
-    # Clean up punctuation spacing
-    text = re.sub(r'\s+([.,!?])', r'\1', text)
-    return text.strip()
+from utils.formatting import (
+    add_section_summaries,
+    build_paragraphs_from_segments,
+    clean_filler_words,
+    detect_content_types,
+    extract_words_from_transcript,
+    format_improved_transcript,
+    format_timestamp,
+    group_into_paragraphs,
+    group_into_sections,
+)
 
 
 def identify_speaker_names(transcript_text, num_speakers):
@@ -387,153 +383,100 @@ def merge_transcription_and_diarization(transcript, diarization):
     return segments
 
 
-def format_transcript_without_diarization(transcript, audio_path):
+def format_transcript_without_diarization(
+    transcript,
+    audio_path,
+    paragraph_duration=30,
+    section_duration=300,
+    generate_toc=True,
+    minimal_timestamps=False,
+    content_markers=False,
+    add_summaries=False,
+    diarization_available=False,
+):
     """
     Format transcript without speaker diarization.
-    Used as fallback when diarization fails.
+    Enhanced for readability with hierarchical structure.
     """
-    output = []
-
-    # Add metadata header
     audio_name = Path(audio_path).name
 
-    output.append("# Podcast Transcript\n")
-    output.append(f"**File:** {audio_name}\n")
-    output.append("**Note:** Speaker diarization was not available for this transcript.\n")
-    output.append("\n---\n\n")
+    words = extract_words_from_transcript(transcript)
+    total_duration = words[-1]["end"] if words else 0.0
+    paragraphs = group_into_paragraphs(
+        words,
+        max_paragraph_seconds=paragraph_duration,
+    )
+    sections = group_into_sections(paragraphs, section_duration)
 
-    # Get text from transcript
-    if hasattr(transcript, 'text'):
-        # Simple transcript with just text
-        output.append(transcript.text)
-    elif hasattr(transcript, 'segments'):
-        # Transcript with segments
-        for segment in transcript.segments:
-            timestamp = format_timestamp(segment.start)
-            output.append(f"{timestamp}\n\n")
-            output.append(f"{segment.text}\n\n")
-    elif hasattr(transcript, 'words'):
-        # Transcript with word-level timestamps
-        # Group words into sentences/paragraphs
-        current_paragraph = []
-        paragraph_start = None
+    if content_markers:
+        sections = detect_content_types(sections)
 
-        for word_data in transcript.words:
-            if isinstance(word_data, dict):
-                word = word_data['word']
-                start = word_data['start']
-            else:
-                word = word_data.word
-                start = word_data.start
+    if add_summaries:
+        sections = add_section_summaries(sections)
 
-            if paragraph_start is None:
-                paragraph_start = start
+    metadata_lines = []
+    if total_duration:
+        metadata_lines.append(f"**Duration:** {format_timestamp(total_duration)}")
 
-            current_paragraph.append(word)
-
-            # Break into paragraphs every ~30 seconds
-            if start - paragraph_start > 30:
-                timestamp = format_timestamp(paragraph_start)
-                para_text = ' '.join(current_paragraph)
-                para_text = clean_filler_words(para_text)
-                if para_text:
-                    output.append(f"{timestamp}\n\n")
-                    output.append(f"{para_text}\n\n")
-                current_paragraph = []
-                paragraph_start = None
-
-        # Write final paragraph
-        if current_paragraph:
-            timestamp = format_timestamp(paragraph_start)
-            para_text = ' '.join(current_paragraph)
-            para_text = clean_filler_words(para_text)
-            if para_text:
-                output.append(f"{timestamp}\n\n")
-                output.append(f"{para_text}\n\n")
-
-    return ''.join(output)
+    return format_improved_transcript(
+        sections,
+        audio_name=audio_name,
+        generate_toc=generate_toc,
+        minimal_timestamps=minimal_timestamps,
+        content_markers=content_markers,
+        diarization_available=diarization_available,
+        metadata_lines=metadata_lines,
+    )
 
 
-def format_transcript(segments, audio_path, speaker_names=None):
+def format_transcript(
+    segments,
+    audio_path,
+    speaker_names=None,
+    paragraph_duration=30,
+    section_duration=300,
+    generate_toc=True,
+    minimal_timestamps=False,
+    content_markers=False,
+    add_summaries=False,
+    diarization_available=True,
+):
     """
-    Format segments into readable markdown with paragraphs,
-    timestamps, and speaker labels.
+    Format diarized segments into readable markdown with hierarchical structure.
     """
-    output = []
-
-    # Add metadata header
     audio_name = Path(audio_path).name
-    total_duration = segments[-1]['end'] if segments else 0
-    speakers = set(seg['speaker'] for seg in segments)
-    num_speakers = len(speakers)
 
-    output.append("# Podcast Transcript\n")
-    output.append(f"**File:** {audio_name}\n")
-    output.append(f"**Duration:** {format_timestamp(total_duration)}\n")
-    output.append(f"**Speakers:** {num_speakers}\n")
-    output.append("\n---\n\n")
+    total_duration = segments[-1]["end"] if segments else 0.0
+    speaker_ids = {seg["speaker"] for seg in segments} if segments else set()
 
-    # Group segments into paragraphs (every ~30 seconds or speaker change)
-    current_speaker = None
-    current_paragraph = []
-    paragraph_start = None
+    paragraphs = build_paragraphs_from_segments(
+        segments,
+        speaker_names=speaker_names,
+        max_duration=paragraph_duration,
+    )
+    sections = group_into_sections(paragraphs, section_duration)
 
-    for seg in segments:
-        speaker = seg['speaker']
+    if content_markers:
+        sections = detect_content_types(sections)
 
-        # Convert speaker label to readable format
-        if speaker_names and speaker in speaker_names:
-            speaker_label = speaker_names[speaker]
-        else:
-            # Extract number from SPEAKER_XX format
-            match = re.search(r'(\d+)', speaker)
-            if match:
-                num = int(match.group(1))
-                speaker_label = f"Speaker {num + 1}"
-            else:
-                speaker_label = speaker
+    if add_summaries:
+        sections = add_section_summaries(sections)
 
-        # Start new paragraph on speaker change
-        if speaker != current_speaker:
-            # Write out previous paragraph
-            if current_paragraph:
-                para_text = ' '.join(current_paragraph)
-                para_text = clean_filler_words(para_text)
-                if para_text:
-                    timestamp = format_timestamp(paragraph_start)
-                    output.append(f"**{current_speaker_label}** {timestamp}\n\n")
-                    output.append(f"{para_text}\n\n")
+    metadata_lines = []
+    if total_duration:
+        metadata_lines.append(f"**Duration:** {format_timestamp(total_duration)}")
+    if speaker_ids:
+        metadata_lines.append(f"**Speakers:** {len(speaker_ids)}")
 
-            # Start new paragraph
-            current_speaker = speaker
-            current_speaker_label = speaker_label
-            current_paragraph = [seg['text']]
-            paragraph_start = seg['start']
-        else:
-            current_paragraph.append(seg['text'])
-
-            # Also break into paragraphs every ~30 seconds for readability
-            if seg['end'] - paragraph_start > 30:
-                para_text = ' '.join(current_paragraph)
-                para_text = clean_filler_words(para_text)
-                if para_text:
-                    timestamp = format_timestamp(paragraph_start)
-                    output.append(f"**{speaker_label}** {timestamp}\n\n")
-                    output.append(f"{para_text}\n\n")
-
-                current_paragraph = []
-                paragraph_start = seg['end']
-
-    # Write final paragraph
-    if current_paragraph:
-        para_text = ' '.join(current_paragraph)
-        para_text = clean_filler_words(para_text)
-        if para_text:
-            timestamp = format_timestamp(paragraph_start)
-            output.append(f"**{current_speaker_label}** {timestamp}\n\n")
-            output.append(f"{para_text}\n\n")
-
-    return ''.join(output)
+    return format_improved_transcript(
+        sections,
+        audio_name=audio_name,
+        generate_toc=generate_toc,
+        minimal_timestamps=minimal_timestamps,
+        content_markers=content_markers,
+        diarization_available=diarization_available,
+        metadata_lines=metadata_lines,
+    )
 
 
 def main():
@@ -584,6 +527,38 @@ def main():
         "--no-diarization",
         action="store_true",
         help="Skip speaker diarization and only transcribe (faster, no speaker labels)"
+    )
+    parser.add_argument(
+        "--paragraph-duration",
+        type=int,
+        default=30,
+        help="Target duration for paragraphs in seconds (default: 30)"
+    )
+    parser.add_argument(
+        "--section-duration",
+        type=int,
+        default=300,
+        help="Target duration for major sections in seconds (default: 300)"
+    )
+    parser.add_argument(
+        "--generate-toc",
+        action="store_true",
+        help="Generate table of contents with anchor links"
+    )
+    parser.add_argument(
+        "--minimal-timestamps",
+        action="store_true",
+        help="Only show section-level timestamps"
+    )
+    parser.add_argument(
+        "--content-markers",
+        action="store_true",
+        help="Add emoji markers for section content types"
+    )
+    parser.add_argument(
+        "--add-summaries",
+        action="store_true",
+        help="Generate AI summaries for each section (requires OpenAI API access)"
     )
 
     args = parser.parse_args()
@@ -692,6 +667,15 @@ def main():
             print("Skipping speaker diarization (--no-diarization flag set)")
             diarization = None
 
+    formatting_options = dict(
+        paragraph_duration=args.paragraph_duration,
+        section_duration=args.section_duration,
+        generate_toc=args.generate_toc,
+        minimal_timestamps=args.minimal_timestamps,
+        content_markers=args.content_markers,
+        add_summaries=args.add_summaries,
+    )
+
     # Format and save based on whether diarization succeeded
     if diarization is not None:
         # Merge transcription and diarization
@@ -713,11 +697,20 @@ def main():
 
         # Format and save
         print("\nFormatting transcript...")
-        formatted = format_transcript(segments, args.audio_file, speaker_names)
+        formatted = format_transcript(
+            segments,
+            args.audio_file,
+            speaker_names=speaker_names,
+            **dict(formatting_options, diarization_available=True),
+        )
     else:
         # Diarization failed or was skipped, save transcript without speaker labels
         print("\nFormatting transcript without speaker labels...")
-        formatted = format_transcript_without_diarization(transcript, args.audio_file)
+        formatted = format_transcript_without_diarization(
+            transcript,
+            args.audio_file,
+            **dict(formatting_options, diarization_available=False),
+        )
 
     with open(output_file, 'w') as f:
         f.write(formatted)

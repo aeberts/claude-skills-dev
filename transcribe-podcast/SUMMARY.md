@@ -77,6 +77,12 @@ python podcast-transcriber/scripts/transcribe_podcast.py \
 - `--delete-temp-files` - Auto-cleanup working directory after completion
 - `--chunk-size MB` - Set target chunk size (default: 20MB)
 - `--overlap-seconds N` - Set chunk overlap duration (default: 5s)
+- `--paragraph-duration` - Control paragraph grouping window (default: 30s)
+- `--section-duration` - Control major section window (default: 5 minutes)
+- `--generate-toc` - Add linked table of contents and anchors
+- `--minimal-timestamps` - Hide per-paragraph timestamps (section timestamps only)
+- `--content-markers` - Add emoji markers for sponsors, Q&A, etc.
+- `--add-summaries` - Generate AI section summaries (requires OpenAI access)
 
 ### Automatic Handling
 - ✅ Compresses large files to WAV at 16kHz
@@ -84,6 +90,14 @@ python podcast-transcriber/scripts/transcribe_podcast.py \
 - ✅ Merges transcripts with deduplication
 - ✅ Falls back gracefully if diarization fails
 - ✅ Preserves working files for debugging
+- ✅ Produces paragraph and section hierarchy for readable transcripts
+- ✅ Optionally inserts TOC, anchor links, summaries, and content markers
+
+### Transcript Readability
+- New shared formatting pipeline converts Whisper word-level timestamps into paragraphs and five-minute sections
+- Table of contents, anchor links, and emoji markers help readers scan the transcript quickly
+- Duplicate timestamps and resets are automatically removed during formatting
+- Reformatter CLI (`scripts/reformat_transcript.py`) upgrades existing fragmented markdown into the new layout
 
 ## Test Suite Benefits
 
@@ -131,6 +145,9 @@ pytest --cov=podcast-transcriber/scripts --cov-report=html
 6. **[tests/README.md](tests/README.md)** - Comprehensive test documentation
 7. **[FIXES.md](FIXES.md)** - Detailed technical documentation
 8. **[SUMMARY.md](SUMMARY.md)** - This file
+9. **[podcast-transcriber/utils/formatting.py](podcast-transcriber/utils/formatting.py)** - Shared formatting helpers
+10. **[scripts/reformat_transcript.py](../scripts/reformat_transcript.py)** - Standalone transcript reformatter
+11. **[tests/test_transcript_formatting.py](tests/test_transcript_formatting.py)** - Coverage for the new formatting pipeline
 
 ## Next Steps
 
@@ -153,6 +170,7 @@ pytest --cov=podcast-transcriber/scripts --cov-report=html
 
 3. **Review output:**
    - Transcript saved as `.md` file
+   - Table of contents, section headers, and timestamps confirm readability improvements
    - Working files in `*_chunks/` directory (preserved for debugging)
    - Add `--delete-temp-files` to auto-cleanup
 

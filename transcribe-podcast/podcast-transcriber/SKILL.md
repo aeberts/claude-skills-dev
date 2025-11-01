@@ -32,9 +32,10 @@ python scripts/transcribe_podcast.py <audio_file.mp3>
 1. Transcribes audio using OpenAI Whisper API (accurate, fast, multi-language)
 2. Identifies speakers using pyannote.audio diarization
 3. Attempts to detect speaker names from transcript context
-4. Formats output with timestamps, speaker labels, and paragraph breaks
-5. Cleans up filler words (um, uh, etc.) for readability
-6. Adds metadata header (duration, speaker count)
+4. Groups content into readable paragraphs and five-minute sections
+5. Generates optional table of contents, anchor links, and content markers
+6. Cleans up filler words (um, uh, etc.) for readability
+7. Adds metadata header (duration, speaker count)
 
 **Output format:**
 ```markdown
@@ -43,16 +44,29 @@ python scripts/transcribe_podcast.py <audio_file.mp3>
 **File:** episode_123.mp3
 **Duration:** [01:23:45]
 **Speakers:** 2
+**Speakers identified via diarization.**
 
 ---
 
-**John Smith** [00:00:15]
+## Table of Contents
 
-Welcome to the show. Today we're discussing...
+- [00:00 Introduction](#00-00-introduction)
+- [05:00 Sponsor: Heart And Soil](#05-00-sponsor-heart-and-soil)
+- [12:00 Hypertension Discussion](#12-00-hypertension-discussion)
 
-**Jane Doe** [00:01:30]
+---
 
-Thanks for having me. I'm excited to talk about...
+## <a id="00-00-introduction"></a>[00:00:00] Introduction
+
+**[00:00:15]** Welcome to the show. Today we're discussing the latest research on metabolic health and why it matters.
+
+## <a id="05-00-sponsor-heart-and-soil"></a>[00:05:02] Sponsor: Heart And Soil
+
+**[00:05:05]** This episode is brought to you by Heart and Soil. Use code PAUL for a discount on nose-to-tail supplements.
+
+## <a id="12-00-hypertension-discussion"></a>[00:12:18] Hypertension Discussion
+
+**[00:12:20]** Let's dive into what causes high blood pressure and how to reverse it with nutrition, sunlight, and movement.
 ```
 
 **Advanced options:**
@@ -65,7 +79,24 @@ python scripts/transcribe_podcast.py audio.mp3 --no-name-detection
 
 # Provide API keys directly (instead of env vars)
 python scripts/transcribe_podcast.py audio.mp3 --openai-key sk-... --hf-token hf_...
+
+# Tune readability
+python scripts/transcribe_podcast.py audio.mp3 --paragraph-duration 45 --section-duration 240
+
+# Generate navigation aids
+python scripts/transcribe_podcast.py audio.mp3 --generate-toc --content-markers
+
+# Produce summaries (requires OPENAI_API_KEY permissions)
+python scripts/transcribe_podcast.py audio.mp3 --add-summaries
 ```
+
+**Readability flags:**
+- `--paragraph-duration`: control paragraph length (seconds per paragraph)
+- `--section-duration`: control section length (seconds per major topic)
+- `--generate-toc`: add a linked table of contents to the output
+- `--minimal-timestamps`: hide per-paragraph timestamps (show section timestamps only)
+- `--content-markers`: display emoji markers for sponsor segments, Q&A, etc.
+- `--add-summaries`: create AI-written section summaries (requires OpenAI access)
 
 **Handling Large Files (>25MB):**
 
@@ -129,6 +160,7 @@ python scripts/format_transcript.py <transcript.txt>
 - User asks to "format this transcript"
 - User provides a text file that's one long paragraph
 - User needs to clean up an auto-generated transcript
+> Use this utility when the source material has **no timestamps** and just needs sentence detection and paragraph regrouping. It does not produce the section/TOC hierarchy provided by the new formatter.
 
 **Example:**
 ```bash
@@ -137,6 +169,24 @@ python scripts/format_transcript.py wall_of_text.txt
 
 # Output: wall_of_text_formatted.md (readable paragraphs)
 ```
+
+#### Reformat Timestamped Markdown
+
+Use `scripts/reformat_transcript.py` to convert existing `[HH:MM:SS]` style transcripts into the improved readable layout:
+
+```bash
+python scripts/reformat_transcript.py fragmented.md readable.md --generate-toc --content-markers
+```
+
+**What it does:**
+1. Parses timestamp fragments (`[HH:MM:SS]` blocks) from an existing markdown file
+2. Groups fragments into paragraphs using silence gaps and sentence endings
+3. Bundles paragraphs into 5-minute sections with generated titles and anchors
+4. Produces the same improved markdown output as the live transcription path
+
+The reformatter refuses to overwrite the source file—always provide a different output path. You can reuse the same readability flags (`--paragraph-duration`, `--section-duration`, `--generate-toc`, `--content-markers`) to match the live transcription behavior.
+
+> Use this utility exclusively for **legacy, timestamp-heavy markdown** files. You do not need to run `format_transcript.py` beforehand, and the two scripts are not chained together.
 
 ## Workflow Guidance
 

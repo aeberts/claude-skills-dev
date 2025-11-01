@@ -1192,6 +1192,10 @@ if __name__ == "__main__":
 
 ## Benefits Summary
 
+**Utility usage guidance**
+- `format_transcript.py` remains the quick fix for wall-of-text transcripts with no timing metadata; it does not invoke the new sectioning pipeline.
+- `reformat_transcript.py` is dedicated to legacy markdown that already contains `[HH:MM:SS]` fragments. Run it directly on those files (no need to call `format_transcript.py` first) to upgrade them to the new readable structure.
+
 ### Quantitative Improvements
 
 | Metric | Before | After | Improvement |
