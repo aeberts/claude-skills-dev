@@ -55,6 +55,7 @@ and it's difficult to articulate just how excited
 - Lines 1738-1741 show same content with different timecodes
 - Timestamp appears to reset at [00:00:00] mid-transcript
 - Indicates processing error in transcription
+- **Fix plan:** normalize the word stream before paragraph grouping. Prefer `transcript.words` when available, fall back to segment text only when needed, and drop monotonically-decreasing timestamp windows so duplicate paragraphs never enter the formatter.
 
 ### 4. **No Content Hierarchy** 🔴 CRITICAL
 - No sections, chapters, or topic markers
@@ -90,52 +91,82 @@ and it's difficult to articulate just how excited
 
 **Implementation:**
 ```python
-def group_into_paragraphs(words, max_paragraph_seconds=30):
+def group_into_paragraphs(
+    words,
+    max_paragraph_seconds=30,
+    pause_threshold=2.5,
+    max_words=140,
+    min_words=12,
+):
     """
-    Group words into paragraphs based on:
-    - Time duration (default: 30 seconds max per paragraph)
-    - Sentence endings (. ! ?)
-    - Natural pauses in speech (>2 second gaps)
+    Turn word-level timestamps into grouped paragraphs.
+
+    Break triggers:
+      - Hard cap: paragraph duration >= max_paragraph_seconds
+      - Long pause: silence >= pause_threshold seconds after the last word
+      - Sentence boundary: paragraph ends with . ! ? and is at least min_words long
+      - Soft cap: duration >= 50% of max + word count >= max_words
 
     Returns:
-        List of paragraphs with start_time, end_time, text
+        List[dict]: [{'start': float, 'end': float, 'text': str}, ...]
     """
     paragraphs = []
-    current_paragraph = []
+    if not words:
+        return paragraphs
+
+    current_tokens = []
     paragraph_start = words[0]['start']
+    last_end = words[0]['start']
 
-    for word in words:
-        current_paragraph.append(word['word'])
-
-        # Check if we should break paragraph
-        duration = word['end'] - paragraph_start
-        is_sentence_end = word['word'].rstrip().endswith(('.', '!', '?'))
-
-        if duration >= max_paragraph_seconds and is_sentence_end:
-            paragraphs.append({
-                'start': paragraph_start,
-                'text': ' '.join(current_paragraph),
-                'end': word['end']
-            })
-            current_paragraph = []
-            paragraph_start = word['end']
-
-    # Add final paragraph
-    if current_paragraph:
+    def flush(last_timestamp):
+        if not current_tokens:
+            return
         paragraphs.append({
             'start': paragraph_start,
-            'text': ' '.join(current_paragraph),
-            'end': words[-1]['end']
+            'end': last_timestamp,
+            'text': ' '.join(current_tokens)
         })
+        current_tokens.clear()
 
+    for idx, token_data in enumerate(words):
+        token = token_data['word']
+        token_start = token_data['start']
+        token_end = token_data['end']
+        pause = token_start - last_end if current_tokens else 0.0
+
+        current_tokens.append(token)
+        last_end = token_end
+
+        duration = token_end - paragraph_start
+        ended_sentence = token.rstrip().endswith(('.', '!', '?'))
+        hit_pause = pause >= pause_threshold
+        hit_hard_cap = duration >= max_paragraph_seconds
+        hit_soft_cap = duration >= max_paragraph_seconds * 0.5 and len(current_tokens) >= max_words
+
+        should_break = False
+        if hit_hard_cap:
+            should_break = True
+        elif ended_sentence and duration >= 6 and len(current_tokens) >= min_words:
+            should_break = True
+        elif hit_pause and len(current_tokens) >= min_words:
+            should_break = True
+        elif hit_soft_cap:
+            should_break = True
+
+        if should_break:
+            flush(token_end)
+            if idx + 1 < len(words):
+                paragraph_start = words[idx + 1]['start']
+
+    flush(last_end)
     return paragraphs
 ```
 
 **Benefits:**
-- Readable continuous prose
-- Natural paragraph breaks
-- Maintains chronological order
-- Preserves ability to find content by time
+- Guaranteed hard cap on paragraph length
+- Breaks on real pauses even without punctuation
+- Smarter handling when Whisper omits sentence-ending tokens
+- Maintains chronological order and precise start/end timestamps
 
 ### B. Hierarchical Timecode System
 
@@ -249,6 +280,8 @@ def generate_table_of_contents(sections):
 
     return '\n'.join(toc)
 
+> **Anchor guarantee:** Because Markdown engines generate their own heading slugs, `format_section()` injects an explicit `<a id="...">` tag using the same `create_anchor_id()` helper so every TOC link resolves.
+
 def create_anchor_id(timestamp, title):
     """Convert timestamp and title to markdown anchor ID."""
     # Format: 000000-introduction--opening-statement
@@ -276,27 +309,35 @@ def create_anchor_id(timestamp, title):
 
 **Implementation (Optional):**
 ```python
-def add_section_summaries(sections, use_ai=True):
+def add_section_summaries(sections, summary_fn=None):
     """
     Add AI-generated summaries to each major section.
 
-    Uses OpenAI API to generate concise summaries of section content.
-    Falls back to first paragraph if AI unavailable.
+    `summary_fn` defaults to `generate_summary_with_openai`, but tests can
+    inject a stub. When the helper returns None, we skip adding a summary.
     """
-    if not use_ai:
-        return sections
+    if summary_fn is None:
+        summary_fn = generate_summary_with_openai  # Local helper defined in this module
 
     for section in sections:
         # Extract section text
         section_text = extract_section_text(section)
 
         # Generate summary via OpenAI
-        summary = generate_summary_with_openai(section_text)
+        summary = summary_fn(section_text)
 
-        section['summary'] = summary
+        if summary:
+            section['summary'] = summary
 
     return sections
 ```
+
+> **Implementation note:** Keep the `'timestamp'` key in sync anywhere sections are built (diarized formatter, reformatter utility, tests) so `generate_table_of_contents()` can consume the shared structure without triggering a `KeyError`.
+
+When `generate_summary_with_openai` is used, it should:
+- Read `OPENAI_API_KEY` from the environment and return `None` if unavailable.
+- Handle API failures gracefully (log + return `None`).
+- Allow tests to supply a fake `summary_fn` so no network calls are required.
 
 ### E. Visual Content Type Markers
 
@@ -336,6 +377,110 @@ _Main thesis: BP increase is lifestyle-related, not age-related_
 ---
 
 ## Phase 3: Implementation Details
+
+### Shared Formatting Utilities
+
+Create `podcast-transcriber/utils/formatting.py` to host shared helpers consumed by both the CLI script and the standalone reformatter.
+
+**Helper Catalog:**
+```python
+def format_timestamp(seconds: float) -> str:
+    """Return HH:MM:SS (existing helper moves here)."""
+
+def format_timestamp_short(seconds: float) -> str:
+    """Return MM:SS when duration < 1 hour, else HH:MM:SS."""
+
+def create_anchor_id(timestamp: float, title: str) -> str:
+    """Convert timestamp + title -> slug used in markdown anchors."""
+
+def extract_section_text(section: dict) -> str:
+    """Concatenate a section's paragraph text for summary generation."""
+
+def extract_sponsor_name(paragraph_text: str) -> str:
+    """Detect sponsor/brand names from intro paragraphs."""
+
+def clean_filler_words(text: str) -> str:
+    """Shared text normalizer (migrated from transcribe_podcast.py)."""
+
+def fragments_to_paragraphs(fragments: list, *, max_paragraph_seconds: int = 30) -> list:
+    """Convert timestamped markdown fragments into paragraph dicts (reformatter entry point)."""
+
+def build_paragraphs_from_segments(
+    segments: list,
+    *,
+    speaker_names: dict | None,
+    max_duration: int = 30,
+) -> list:
+    """Convert diarized segments into paragraph dicts with speaker metadata."""
+
+def format_section(section: dict, *, minimal_timestamps: bool, show_markers: bool) -> str:
+    """Shared section formatter (migrated from transcribe_podcast.py)."""
+
+def format_improved_transcript(
+    sections: list,
+    *,
+    audio_name: str,
+    generate_toc: bool,
+    minimal_timestamps: bool,
+    content_markers: bool,
+    diarization_available: bool,
+) -> str:
+    """Compose metadata header, optional TOC, and section bodies into markdown."""
+
+def generate_summary_with_openai(section_text: str, *, model: str = "gpt-4o-mini") -> str | None:
+    """Optional AI summary helper; reads OPENAI_API_KEY and returns None on failure."""
+```
+
+`format_improved_transcript` serves as the single entry point for building the final markdown output. Both the CLI path and the reformat utility feed `sections` and formatting options into this helper, ensuring the rendered structure stays consistent across tools. Existing helpers such as `group_into_sections` and `clean_filler_words` move into this module so there is one source of truth.
+
+**Formatting Workflow Example:**
+```python
+def format_improved_transcript(
+    sections,
+    *,
+    audio_name,
+    generate_toc,
+    minimal_timestamps,
+    content_markers,
+    diarization_available,
+):
+    note_line = (
+        "**Speakers identified via diarization.**"
+        if diarization_available
+        else "**Note:** Speaker diarization was not available for this transcript."
+    )
+
+    header = [
+        "# Podcast Transcript",
+        f"**File:** {audio_name}",
+        note_line,
+        "",
+        "---",
+        "",
+    ]
+
+    toc_block = [generate_table_of_contents(sections), "", "---", ""] if generate_toc else []
+
+    body = [
+        format_section(
+            section,
+            minimal_timestamps=minimal_timestamps,
+            show_markers=content_markers,
+        )
+        for section in sections
+    ]
+
+    return "\n".join(header + toc_block + body)
+```
+
+> **Callers:** Pass `diarization_available=True` when speaker diarization succeeded so the header note reflects the correct state; fallback utilities pass `False`.
+
+**Testing Targets:**
+- Timestamp helpers (`format_timestamp_short`, `create_anchor_id`) unit tests.
+- `extract_sponsor_name` coverage for common sponsor keyword variants.
+- `extract_words_from_transcript` fixtures covering segment-level words, top-level words, deduplication of overlapping token streams, and timestamp reset handling.
+- `format_improved_transcript` snapshot tests (with/without TOC, markers, summaries).
+- `generate_summary_with_openai` wrapped via injectable `summary_fn` to stub API in tests.
 
 ### Modifications to `transcribe_podcast.py`
 
@@ -391,7 +536,8 @@ def format_transcript_without_diarization(
     generate_toc=True,
     minimal_timestamps=False,
     content_markers=False,
-    add_summaries=False
+    add_summaries=False,
+    diarization_available=False,
 ):
     """
     Format transcript without speaker diarization.
@@ -416,7 +562,12 @@ def format_transcript_without_diarization(
     audio_name = Path(audio_path).name
     output.append("# Podcast Transcript\n")
     output.append(f"**File:** {audio_name}\n")
-    output.append("**Note:** Speaker diarization was not available for this transcript.\n")
+    note_line = (
+        "**Speakers identified via diarization.**\n"
+        if diarization_available
+        else "**Note:** Speaker diarization was not available for this transcript.\n"
+    )
+    output.append(note_line)
     output.append("\n---\n\n")
 
     # Get words from transcript
@@ -453,29 +604,158 @@ def format_transcript_without_diarization(
     return ''.join(output)
 ```
 
+```python
+def format_transcript(
+    segments,
+    audio_path,
+    speaker_names=None,
+    paragraph_duration=30,
+    section_duration=300,
+    generate_toc=True,
+    minimal_timestamps=False,
+    content_markers=False,
+    add_summaries=False,
+    diarization_available=True,
+):
+    """
+    Speaker-aware version that feeds the same section/paragraph pipeline.
+    """
+    output = []
+    audio_name = Path(audio_path).name
+    output.append("# Podcast Transcript\n")
+    output.append(f"**File:** {audio_name}\n")
+
+    total_duration = segments[-1]['end'] if segments else 0
+    output.append(f"**Duration:** {format_timestamp(total_duration)}\n")
+    output.append(f"**Speakers:** {len(set(seg['speaker'] for seg in segments))}\n")
+    if not diarization_available:
+        output.append("**Note:** Speaker diarization was not available for this transcript.\n")
+    output.append("\n---\n\n")
+
+    paragraphs = build_paragraphs_from_segments(
+        segments,
+        speaker_names=speaker_names,
+        max_duration=paragraph_duration,
+    )
+
+    sections = group_into_sections(paragraphs, section_duration)
+
+    if content_markers:
+        sections = detect_content_types(sections)
+
+    if add_summaries:
+        sections = add_section_summaries(sections)
+
+    if generate_toc:
+        toc = generate_table_of_contents(sections)
+        output.append(toc)
+        output.append("\n---\n\n")
+
+    for section in sections:
+        output.append(format_section(
+            section,
+            minimal_timestamps=minimal_timestamps,
+            show_markers=content_markers
+        ))
+
+    return ''.join(output)
+```
+
 **Helper Functions:**
 
 ```python
 def extract_words_from_transcript(transcript):
     """Extract words with timestamps from transcript object."""
     words = []
+    seen_tokens = set()
+    last_end = None
+    reset_threshold = 2.0  # seconds; treat larger backwards jumps as a reset
+
+    def append_word(word_data):
+        """Normalize heterogenous word payloads into dicts."""
+        nonlocal last_end
+        if word_data is None:
+            return
+
+        if isinstance(word_data, dict):
+            token = word_data.get('word') or word_data.get('text')
+            start = word_data.get('start')
+            end = word_data.get('end')
+        else:
+            token = getattr(word_data, 'word', None) or getattr(word_data, 'text', None)
+            start = getattr(word_data, 'start', None) or getattr(word_data, 'start_time', None)
+            end = getattr(word_data, 'end', None) or getattr(word_data, 'end_time', None)
+
+        if token is None or start is None or end is None:
+            return
+
+        try:
+            start_f = float(start)
+            end_f = float(end)
+        except (TypeError, ValueError):
+            return
+
+        dedupe_key = (round(start_f, 3), round(end_f, 3), token)
+        if dedupe_key in seen_tokens:
+            return
+
+        # Guard against timestamp resets: if we suddenly jump backwards by more than
+        # `reset_threshold`, clear the collected stream so downstream grouping does not
+        # produce duplicated paragraphs.
+        if last_end is not None and start_f + 1e-3 < last_end - reset_threshold:
+            words.clear()
+            seen_tokens.clear()
+
+        # Record this token now that we know the stream is monotonic.
+        seen_tokens.add(dedupe_key)
+
+        last_end = end_f
+
+        words.append({
+            'word': token,
+            'start': start_f,
+            'end': end_f,
+        })
 
     if hasattr(transcript, 'words') and transcript.words:
         for word_data in transcript.words:
-            if isinstance(word_data, dict):
-                words.append({
-                    'word': word_data['word'],
-                    'start': word_data['start'],
-                    'end': word_data['end']
-                })
-            else:
-                words.append({
-                    'word': word_data.word,
-                    'start': word_data.start,
-                    'end': word_data.end
-                })
+            append_word(word_data)
 
+    # Only fall back to segment-level text when word-level timing is unavailable.
+    use_segments = not words
+    segments = []
+    if hasattr(transcript, 'segments') and transcript.segments:
+        segments = transcript.segments
+    elif isinstance(transcript, dict) and transcript.get('segments'):
+        segments = transcript['segments']
+
+    for segment in segments or []:
+        if isinstance(segment, dict):
+            segment_words = segment.get('words')
+            segment_text = segment.get('text')
+            start = segment.get('start')
+            end = segment.get('end')
+        else:
+            segment_words = getattr(segment, 'words', None)
+            segment_text = getattr(segment, 'text', None)
+            start = getattr(segment, 'start', None)
+            end = getattr(segment, 'end', None)
+
+        if segment_words and use_segments:
+            for word_data in segment_words:
+                append_word(word_data)
+        elif segment_text and use_segments:
+            # Fallback: ensure segments without word-level timestamps still produce content
+            append_word({
+                'word': segment_text.strip(),
+                'start': start,
+                'end': end,
+            })
+
+    words.sort(key=lambda w: w['start'])
     return words
+
+> **Implementation detail:** `seen_tokens` deduplicates Whisper outputs that supply both `transcript.words` and per-segment `words`, and the `reset_threshold` guard prevents non-monotonic timestamp resets (e.g., the mid-transcript `[00:00:00]` bug) from leaking duplicate paragraphs into downstream formatting.
 
 def group_into_sections(paragraphs, section_duration=300):
     """Group paragraphs into major sections."""
@@ -483,6 +763,7 @@ def group_into_sections(paragraphs, section_duration=300):
     current_section = {
         'paragraphs': [],
         'start': paragraphs[0]['start'] if paragraphs else 0,
+        'timestamp': paragraphs[0]['start'] if paragraphs else 0,  # Alias used by TOC builder
         'title': None  # Will be auto-generated or left generic
     }
 
@@ -497,6 +778,7 @@ def group_into_sections(paragraphs, section_duration=300):
             current_section = {
                 'paragraphs': [para],
                 'start': para['start'],
+                'timestamp': para['start'],  # Keep timestamp key in sync with TOC expectations
                 'title': None
             }
         else:
@@ -504,6 +786,7 @@ def group_into_sections(paragraphs, section_duration=300):
 
     # Add final section
     if current_section['paragraphs']:
+        current_section.setdefault('timestamp', current_section['start'])
         sections.append(current_section)
 
     # Generate section titles
@@ -549,6 +832,116 @@ def generate_section_titles(sections):
 
     return sections
 
+def build_paragraphs_from_segments(segments, speaker_names=None, max_duration=30):
+    """Convert diarized segments into paragraphs with speaker labels."""
+    paragraphs = []
+    current_speaker = None
+    current_label = ""
+    current_text = []
+    paragraph_start = None
+    paragraph_end = None
+
+    def speaker_label(raw_speaker):
+        if speaker_names and raw_speaker in speaker_names:
+            return speaker_names[raw_speaker]
+        match = re.search(r'(\d+)', raw_speaker)
+        if match:
+            return f"Speaker {int(match.group(1)) + 1}"
+        return raw_speaker
+
+    def flush():
+        if not current_text:
+            return
+        paragraphs.append({
+            'start': paragraph_start,
+            'end': paragraph_end,
+            'text': f"**{current_label}:** {' '.join(current_text)}"
+        })
+
+    for seg in segments:
+        speaker = seg['speaker']
+        label = speaker_label(speaker)
+
+        if current_speaker is None:
+            current_speaker = speaker
+            current_label = label
+            paragraph_start = seg['start']
+            current_text = [seg['text']]
+            paragraph_end = seg['end']
+            continue
+
+        duration = seg['end'] - paragraph_start
+        speaker_changed = speaker != current_speaker
+        if speaker_changed or duration >= max_duration:
+            flush()
+            current_speaker = speaker
+            current_label = label
+            paragraph_start = seg['start']
+            current_text = [seg['text']]
+        else:
+            current_text.append(seg['text'])
+
+        paragraph_end = seg['end']
+
+    flush()
+    return paragraphs
+
+def fragments_to_paragraphs(
+    fragments,
+    max_paragraph_seconds=30,
+    pause_threshold=2.5,
+    min_fragments=2,
+):
+    """Convert timestamped markdown fragments into paragraph dicts."""
+    if not fragments:
+        return []
+
+    paragraphs = []
+    current_text = []
+    paragraph_start = fragments[0]['timestamp']
+    last_timestamp = paragraph_start
+
+    def flush(final_timestamp):
+        if not current_text:
+            return
+        paragraphs.append({
+            'start': paragraph_start,
+            'end': final_timestamp,
+            'text': ' '.join(current_text)
+        })
+
+    for idx, frag in enumerate(fragments):
+        start = frag['timestamp']
+        text = frag['text']
+        duration = start - paragraph_start
+        pause = start - last_timestamp if current_text else 0.0
+
+        current_text.append(text)
+        last_timestamp = start
+
+        is_sentence_end = text.rstrip().endswith(('.', '!', '?'))
+        hit_hard_cap = duration >= max_paragraph_seconds
+        hit_pause = pause >= pause_threshold
+
+        should_break = False
+        if hit_hard_cap:
+            should_break = True
+        elif is_sentence_end and duration >= 6 and len(current_text) >= min_fragments:
+            should_break = True
+        elif hit_pause and len(current_text) >= min_fragments:
+            should_break = True
+
+        if should_break:
+            flush(start)
+            current_text = []
+            if idx + 1 < len(fragments):
+                paragraph_start = fragments[idx + 1]['timestamp']
+
+    if current_text:
+        flush(last_timestamp)
+
+    return paragraphs
+
 def detect_content_types(sections):
     """Add content type markers (emoji) to sections."""
     type_markers = {
@@ -585,10 +978,15 @@ def format_section(section, minimal_timestamps=False, show_markers=False):
 
     # Section header
     timestamp = format_timestamp(section['start'])
+    anchor_id = create_anchor_id(
+        section['timestamp'],
+        section.get('title', 'section')
+    )
     marker = section.get('marker', '') if show_markers else ''
     title = section.get('title', 'Section')
 
-    output.append(f"\n## {marker} [{timestamp}] {title}\n\n")
+    output.append(f'\n<a id="{anchor_id}"></a>\n')
+    output.append(f"## {marker} [{timestamp}] {title}\n\n")
 
     # Optional summary
     if section.get('summary'):
@@ -606,6 +1004,38 @@ def format_section(section, minimal_timestamps=False, show_markers=False):
 
     return ''.join(output)
 ```
+
+### Main Flow Integration
+
+Thread the new CLI options directly into the formatting calls so both diarized and non-diarized paths stay in sync:
+
+```python
+    formatting_options = dict(
+        paragraph_duration=args.paragraph_duration,
+        section_duration=args.section_duration,
+        generate_toc=args.generate_toc,
+        minimal_timestamps=args.minimal_timestamps,
+        content_markers=args.content_markers,
+        add_summaries=args.add_summaries,
+        diarization_available=diarization is not None,
+    )
+
+    if diarization is not None:
+        formatted = format_transcript(
+            segments,
+            args.audio_file,
+            speaker_names=speaker_names,
+            **formatting_options,
+        )
+    else:
+        formatted = format_transcript_without_diarization(
+            transcript,
+            args.audio_file,
+            **formatting_options,
+        )
+```
+
+`format_transcript` receives the same keyword arguments so that diarized transcripts run through the identical section/paragraph pipeline (with speaker metadata layered on top).
 
 ---
 
@@ -627,11 +1057,18 @@ Options:
     --paragraph-duration SECONDS    Group into paragraphs (default: 30)
     --generate-toc                  Add table of contents
     --content-markers               Add emoji content type markers
+    --section-duration SECONDS      Group paragraphs into sections (default: 300)
 """
 
 import argparse
 import re
 from pathlib import Path
+
+from podcast_transcriber.utils.formatting import (
+    format_improved_transcript,
+    fragments_to_paragraphs,
+    group_into_sections,
+)
 
 def parse_fragmented_transcript(file_path):
     """
@@ -673,56 +1110,15 @@ def parse_fragmented_transcript(file_path):
 
     return fragments
 
-def merge_into_paragraphs(fragments, max_duration=30):
-    """Merge fragments into paragraphs."""
-    if not fragments:
-        return []
-
-    paragraphs = []
-    current_para = {
-        'start': fragments[0]['timestamp'],
-        'texts': [fragments[0]['text']]
-    }
-
-    for i in range(1, len(fragments)):
-        frag = fragments[i]
-        duration = frag['timestamp'] - current_para['start']
-
-        # Check if sentence ended
-        prev_text = current_para['texts'][-1]
-        is_sentence_end = prev_text.rstrip().endswith(('.', '!', '?'))
-
-        # Break paragraph
-        if duration >= max_duration and is_sentence_end:
-            paragraphs.append({
-                'start': current_para['start'],
-                'text': ' '.join(current_para['texts'])
-            })
-            current_para = {
-                'start': frag['timestamp'],
-                'texts': [frag['text']]
-            }
-        else:
-            current_para['texts'].append(frag['text'])
-
-    # Add final paragraph
-    if current_para['texts']:
-        paragraphs.append({
-            'start': current_para['start'],
-            'text': ' '.join(current_para['texts'])
-        })
-
-    return paragraphs
-
 def reformat_transcript(input_file, output_file, **options):
     """Main reformatting function."""
     # Parse existing file
     fragments = parse_fragmented_transcript(input_file)
 
     # Merge into paragraphs
-    paragraphs = merge_into_paragraphs(
+    paragraphs = fragments_to_paragraphs(
         fragments,
-        max_duration=options.get('paragraph_duration', 30)
+        max_paragraph_seconds=options.get('paragraph_duration', 30)
     )
 
     # Group into sections
@@ -734,8 +1130,11 @@ def reformat_transcript(input_file, output_file, **options):
     # Generate output
     output = format_improved_transcript(
         sections,
-        input_file=input_file,
-        **options
+        audio_name=Path(input_file).name,
+        generate_toc=options.get('generate_toc', False),
+        minimal_timestamps=False,
+        content_markers=options.get('content_markers', False),
+        diarization_available=False,
     )
 
     # Write to file
@@ -767,6 +1166,12 @@ def main():
         action="store_true",
         help="Add emoji content type markers"
     )
+    parser.add_argument(
+        "--section-duration",
+        type=int,
+        default=300,
+        help="Maximum section duration in seconds"
+    )
 
     args = parser.parse_args()
 
@@ -774,6 +1179,7 @@ def main():
         args.input,
         args.output,
         paragraph_duration=args.paragraph_duration,
+        section_duration=args.section_duration,
         generate_toc=args.generate_toc,
         content_markers=args.content_markers
     )
@@ -872,7 +1278,7 @@ if __name__ == "__main__":
 
 4. **Edge Cases**
    - No timestamps
-   - Duplicate timestamps
+   - Duplicate timestamps / timestamp resets (verify dedupe & reset guard)
    - Very long paragraphs
    - Very short audio
 
@@ -941,17 +1347,19 @@ the United States.
 
 ### New Files
 1. `/scripts/reformat_transcript.py` - Utility to reformat existing transcripts
-2. `/tests/test_transcript_formatting.py` - Tests for new formatting functions
+2. `/podcast-transcriber/utils/formatting.py` - Shared formatting helpers for transcripts
+3. `/tests/test_transcript_formatting.py` - Tests for new formatting functions
 
 ### Modified Files
 1. `/podcast-transcriber/scripts/transcribe_podcast.py`
    - Update `format_transcript_without_diarization()`
    - Add new command-line arguments
-   - Add helper functions
+   - Import helpers from `utils/formatting.py`
 
 ### Documentation Updates
 1. `/podcast-transcriber/SKILL.md` - Document new flags
 2. `/transcribe-podcast/README.md` - Update usage examples
+3. `/podcast-transcriber/utils/formatting.py` - Inline docstrings describing helper responsibilities
 
 ---
 
