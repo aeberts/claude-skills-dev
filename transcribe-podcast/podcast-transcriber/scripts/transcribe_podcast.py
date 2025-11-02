@@ -607,10 +607,11 @@ def main():
         print(f"Working directory: {work_dir}\n")
 
         # Step 1: Compress audio
-        compressed_path = work_dir / "compressed_audio.mp3"
+        # Note: compress_audio returns the actual path (WAV format for exact sample alignment)
+        compressed_path_requested = work_dir / "compressed_audio.mp3"
         print(f"Step 1: Compressing audio...")
-        compress_audio(args.audio_file, str(compressed_path))
-        compressed_size = get_file_size_mb(str(compressed_path))
+        compressed_path = compress_audio(args.audio_file, str(compressed_path_requested))
+        compressed_size = get_file_size_mb(compressed_path)
         print(f"Compressed size: {compressed_size:.2f} MB\n")
 
         # Step 2: Check if still needs chunking after compression
